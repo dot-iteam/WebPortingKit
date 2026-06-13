@@ -7,20 +7,30 @@
 
 import NIOSSL
 import Foundation
+
+/// A PEM-encoded TLS identity source.
 public enum SecureServerIdentity: Sendable {
+    /// Load PEM data from a filesystem path.
     case file(String)
+
+    /// Load PEM data from a file URL.
     case url(URL)
+
+    /// Load PEM data from memory.
     case data(Data)
 }
+
+/// The private key and certificate chain used by a secure HTTP server.
 public enum SecureIdentityPair: Sendable {
+    /// A private key and certificate chain pair.
     case pair(privateKey: SecureServerIdentity, certificate: SecureServerIdentity)
 }
-func makeSSLContext(from pair: SecureIdentityPair) throws -> NIOSSLContext? {
+
+func makeSSLContext(from pair: SecureIdentityPair, mode: HTTPSProtocolMode = .http2) throws -> NIOSSLContext? {
     guard case .pair(let privateKey, let certificate) = pair else {
         return nil
     }
     var sslPrivateKey: NIOSSLPrivateKeySource
-    var sslCertificate: NIOSSLCertificateSource
     switch privateKey {
     case .file(let file):
         sslPrivateKey = try .privateKey(NIOSSLPrivateKey.init(file: file, format: .pem))
@@ -30,27 +40,40 @@ func makeSSLContext(from pair: SecureIdentityPair) throws -> NIOSSLContext? {
         let data = try Data(contentsOf: url)
         sslPrivateKey = try .privateKey(NIOSSLPrivateKey.init(bytes: [UInt8](data), format: .pem))
     }
-    switch certificate {
-    case .file(let file):
-        guard let firstCertificate = try NIOSSLCertificate.fromPEMFile(file).first else {
-            return nil
-        }
-        sslCertificate = .certificate(firstCertificate)
-    case .data(let data):
-        sslCertificate = try .certificate(NIOSSLCertificate.init(bytes: [UInt8](data), format: .pem))
-    case .url(let url):
-        let data = try Data(contentsOf: url)
-        sslCertificate = try .certificate(NIOSSLCertificate.init(bytes: [UInt8](data), format: .pem))
+    let sslCertificateChain = try certificateChain(from: certificate)
+    guard !sslCertificateChain.isEmpty else {
+        return nil
     }
-    // Set up the TLS configuration, it's important to set the `applicationProtocols` to
-    // `NIOHTTP2SupportedALPNProtocols` which (using ALPN (https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation))
-    // advertises the support of HTTP/2 to the client.
     var serverConfig = TLSConfiguration.makeServerConfiguration(
-        certificateChain: [sslCertificate],
+        certificateChain: sslCertificateChain,
         privateKey: sslPrivateKey
     )
-    serverConfig.applicationProtocols = ["h2"]
+    switch mode {
+    case .http1:
+        serverConfig.applicationProtocols = ["http/1.1"]
+    case .http2:
+        serverConfig.applicationProtocols = ["h2"]
+    case .negotiated:
+        serverConfig.applicationProtocols = ["h2", "http/1.1"]
+    }
     // Configure the SSL context that is used by all SSL handlers.
-    let sslContext = try! NIOSSLContext(configuration: serverConfig)
-    return sslContext
+    return try NIOSSLContext(configuration: serverConfig)
+}
+
+/// Loads the full certificate chain (leaf followed by any intermediates) from a
+/// PEM source, preserving file order.
+///
+/// - Important: PEM blocks must be ordered leaf-first, then intermediates ascending
+///   toward, but not including, the root, as in a typical `fullchain.pem`.
+func certificateChain(from source: SecureServerIdentity) throws -> [NIOSSLCertificateSource] {
+    let certificates: [NIOSSLCertificate]
+    switch source {
+    case .file(let file):
+        certificates = try NIOSSLCertificate.fromPEMFile(file)
+    case .data(let data):
+        certificates = try NIOSSLCertificate.fromPEMBytes([UInt8](data))
+    case .url(let url):
+        certificates = try NIOSSLCertificate.fromPEMBytes([UInt8](Data(contentsOf: url)))
+    }
+    return certificates.map { NIOSSLCertificateSource.certificate($0) }
 }

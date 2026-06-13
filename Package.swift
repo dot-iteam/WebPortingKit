@@ -45,7 +45,15 @@ let package = Package(
         ),
         .testTarget(
             name: "WebPortingKitTest",
-            dependencies: ["WebPortingKit"]
+            dependencies: [
+                "WebPortingKit",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio")
+            ],
+            resources: [
+                .process("Fixtures")
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

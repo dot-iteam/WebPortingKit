@@ -7,59 +7,94 @@
 
 import Foundation
 import RegexBuilder
-public struct MultipartFormPart: CustomStringConvertible {
+
+/// A file-like part from a `multipart/form-data` request.
+///
+/// Parts with a filename or content type are treated as files by
+/// ``decodeMultipartFormData(type:stream:)`` and are kept separate from the typed
+/// form field model.
+public struct MultipartFile: CustomStringConvertible {
+    /// The `name` parameter from `Content-Disposition`, if present.
     public var name: String?
+
+    /// The part headers keyed by lowercased header name.
     public var headers: [String: String]
+
+    /// Parsed parameters from the `Content-Disposition` header.
     public var contentDisposition: [String:String]
+
+    /// The `filename` parameter from `Content-Disposition`, if present.
     public var filename: String?
+
+    /// The part `Content-Type`, if present.
     public var contentType: String?
+
+    /// The raw bytes for the part body.
     public var data: Data?
+
+    /// Parses a `Content-Disposition: form-data` header into lowercased parameters.
+    ///
+    /// - Parameter value: The raw `Content-Disposition` header value.
     public static func parseContentDisposition(value: String) -> [String:String] {
-        let fileNameRegex = Local {
-            Optionally {
-                ";"
-            }
-            ZeroOrMore { .whitespace }
-            "filename=\""
-            Capture {
-                ZeroOrMore {
-                    CharacterClass.anyOf("\"").inverted
-                }
-            }
-            "\""
-        }
-        let nameRegex = Local {
-            "name=\""
-            Capture {
-                ZeroOrMore {
-                    CharacterClass.anyOf("\"").inverted
-                }
-            }
-            
-            "\""
-        }
-        let regex = Regex {
+        let mediaTypeRegex = Regex {
             Anchor.startOfSubject
-            ZeroOrMore(.whitespace)
-            "form-data;"
-            ZeroOrMore {
-                .whitespace
+            ZeroOrMore { CharacterClass.whitespace }
+            "form-data"
+            ZeroOrMore { CharacterClass.whitespace }
+            Optionally { ";" }
+        }
+        guard value.firstMatch(of: mediaTypeRegex) != nil else {
+            return [:]
+        }
+
+        let parameterRegex = Regex {
+            Optionally { ";" }
+            ZeroOrMore { CharacterClass.whitespace }
+            Capture {
+                OneOrMore {
+                    CharacterClass(
+                        CharacterClass.word,
+                        CharacterClass.digit,
+                        CharacterClass.anyOf("!#$%&'*+-.^_`|~")
+                    )
+                }
             }
-            Optionally {
-                nameRegex
-            }
-            ZeroOrMore { .whitespace }
-            Optionally {
-                fileNameRegex
+            ZeroOrMore { CharacterClass.whitespace }
+            "="
+            ZeroOrMore { CharacterClass.whitespace }
+            ChoiceOf {
+                Regex {
+                    "\""
+                    Capture {
+                        ZeroOrMore {
+                            CharacterClass.anyOf("\"").inverted
+                        }
+                    }
+                    "\""
+                }
+                Capture {
+                    OneOrMore {
+                        CharacterClass.anyOf(";").inverted
+                    }
+                }
             }
         }
-        
+
         var result: [String:String] = [:]
-        let match = value.firstMatch(of: regex)
-        result["name"] = match?.output.1?.description
-        result["filename"] = match?.output.2?.description
+        for match in value.matches(of: parameterRegex) {
+            let key = match.output.1.description.lowercased()
+            let quotedValue = match.output.2?.description
+            let tokenValue = match.output.3?.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            result[key] = quotedValue ?? tokenValue
+        }
         return result
     }
+
+    /// Creates a multipart file part from parsed headers and optional body data.
+    ///
+    /// - Parameters:
+    ///   - headers: Part headers keyed by lowercased header name.
+    ///   - data: The raw part body bytes.
     public init(headers: [String : String], data: Data? = nil) {
         self.contentDisposition = Self.parseContentDisposition(value: headers["content-disposition"] ?? "")
         self.name = contentDisposition["name"]
@@ -67,39 +102,53 @@ public struct MultipartFormPart: CustomStringConvertible {
         self.filename = contentDisposition["filename"]
         self.contentType = headers["content-type"]
         self.data = data
-        
     }
+
+    /// A UTF-8 view of ``data`` for debugging, or an empty string when unavailable.
     public var description: String {
-        guard data != nil else {
+        guard let data else {
             return ""
         }
-        return String(data: data!, encoding: .utf8) ?? ""
+        return String(data: data, encoding: .utf8) ?? ""
     }
 }
+
+/// Compatibility alias for the previous multipart part type name.
+@available(*, deprecated, renamed: "MultipartFile")
+public typealias MultipartFormPart = MultipartFile
+
+/// A decoded multipart form with typed fields and file parts kept separate.
+public struct DecodedMultipartForm<Form: Decodable> {
+    /// File parts grouped by their form field name.
+    public let files: [String: [MultipartFile]]
+
+    /// The typed non-file form fields, or `nil` when decoding fails.
+    public let form: Form?
+
+    /// Creates a decoded multipart form result.
+    public init(files: [String: [MultipartFile]], form: Form?) {
+        self.files = files
+        self.form = form
+    }
+}
+
+/// A streaming parser for `multipart/form-data` bodies held in memory.
 public struct MultipartFormStream {
+    /// The normalized body data parsed by the stream.
     public let data: Data
+
+    /// The boundary marker used between parts, including the leading CRLF delimiter.
     public let boundary: Data
+
     var index: Int = 0
+
+    /// Creates a multipart stream from body data and a `Content-Type` header.
+    ///
+    /// Returns `nil` when the content type is not `multipart/form-data`, the boundary
+    /// parameter is missing, or the first boundary cannot be found in the body.
     public init?(data: Data, contentType: String) {
-        self.data = data
-        let regex = Regex {
-            Anchor.startOfSubject
-            "multipart/form-data;"
-            ZeroOrMore {
-                CharacterClass.whitespace
-            }
-            "boundary="
-            Capture {
-                ZeroOrMore {
-                    CharacterClass.any
-                }
-            }
-        }
-        guard let match = contentType.firstMatch(of: regex) else {
-            return nil
-        }
-        let boundary = match.output.1.description
-        guard boundary.count > 0 else {
+        self.data = Data(data)
+        guard let boundary = Self.boundary(from: contentType) else {
             return nil
         }
         let firstBoundary = "--\(boundary)".data(using: .utf8) ?? Data()
@@ -111,12 +160,75 @@ public struct MultipartFormStream {
             return nil
         }
     }
+
+    private static func boundary(from contentType: String) -> String? {
+        let mediaTypeRegex = Regex {
+            Anchor.startOfSubject
+            ZeroOrMore { CharacterClass.whitespace }
+            "multipart/form-data"
+                .regex.ignoresCase()
+            ZeroOrMore { CharacterClass.whitespace }
+            Optionally {
+                ";"
+            }
+        }
+        guard contentType.firstMatch(of: mediaTypeRegex) != nil else {
+            return nil
+        }
+
+        let parameterRegex = Regex {
+            Optionally {
+                ";"
+            }
+            ZeroOrMore { CharacterClass.whitespace }
+            Capture {
+                OneOrMore {
+                    CharacterClass(
+                        CharacterClass.word,
+                        CharacterClass.digit,
+                        CharacterClass.anyOf("!#$%&'*+-.^_`|~")
+                    )
+                }
+            }
+            ZeroOrMore { CharacterClass.whitespace }
+            "="
+            ZeroOrMore { CharacterClass.whitespace }
+            ChoiceOf {
+                Regex {
+                    "\""
+                    Capture {
+                        ZeroOrMore {
+                            CharacterClass.anyOf("\"").inverted
+                        }
+                    }
+                    "\""
+                }
+                Capture {
+                    OneOrMore {
+                        CharacterClass.anyOf(";").inverted
+                    }
+                }
+            }
+        }
+
+        for match in contentType.matches(of: parameterRegex) {
+            guard match.output.1.description.lowercased() == "boundary" else {
+                continue
+            }
+            let quotedValue = match.output.2?.description
+            let tokenValue = match.output.3?.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            let boundary = quotedValue ?? tokenValue ?? ""
+            return boundary.isEmpty ? nil : boundary
+        }
+        return nil
+    }
+
     mutating func nextBound(bound: Data) -> Bool {
        var lps = Array(repeating: 0, count: bound.count)
        var length = 0
        var i = 1
        while i < bound.count {
-           if bound[i] == bound[length] {
+           if bound[bound.startIndex + i] == bound[bound.startIndex + length] {
                length += 1
                lps[i] = length
                i += 1
@@ -129,14 +241,8 @@ public struct MultipartFormStream {
        }
         var boundIndex = 0
         while index < data.count {
-            var byte = data[index]
-            if byte >= 0x41 && byte <= 0x5a {
-                byte |= 0x60
-            }
-            var boundByte = bound[boundIndex]
-            if boundByte >= 0x41 && boundByte <= 0x5a {
-                boundByte |= 0x60
-            }
+            let byte = data[data.startIndex + index]
+            let boundByte = bound[bound.startIndex + boundIndex]
             if byte == boundByte {
                 if boundIndex == bound.count - 1 {
                     index += 1
@@ -150,17 +256,23 @@ public struct MultipartFormStream {
             } else {
                 index += 1
             }
-            
         }
         return false
     }
+
     let partSeparator = "\r\n\r\n".data(using: .utf8) ?? Data()
     let partDataSuffix = "\r\n".data(using: .utf8) ?? Data()
-    public mutating func next() -> MultipartFormPart? {
+
+    /// Returns the next multipart part, or `nil` when the stream is exhausted.
+    public mutating func next() -> MultipartFile? {
         var beginIndex = index
-        var part : MultipartFormPart
+        var part : MultipartFile
         if nextBound(bound: partSeparator) {
-            part = MultipartFormPart(headers: parseBlockHeader(data: data[beginIndex..<index-partSeparator.count]))
+            part = MultipartFile(
+                headers: parseBlockHeader(
+                    data: data[data.startIndex + beginIndex..<data.startIndex + index - partSeparator.count]
+                )
+            )
         } else {
             return nil
         }
@@ -170,6 +282,7 @@ public struct MultipartFormStream {
         }
         return part
     }
+
     func parseBlockHeader(data: Data) -> [String: String] {
         guard let headersString = String(data: data, encoding: .utf8) else {
             return [:]
@@ -197,7 +310,6 @@ public struct MultipartFormStream {
                     CharacterClass.any
                 }
             }
-
         }
         var result = [String: String]()
         let matches = headersString.matches(of: regex)
@@ -205,41 +317,38 @@ public struct MultipartFormStream {
             let key = match.output.1.description.lowercased().trimmingCharacters(
                 in: .whitespaces
             )
-            let value = match.output.2.description.lowercased().trimmingCharacters(in: .whitespaces)
+            let value = match.output.2.description.trimmingCharacters(in: .whitespaces)
             result[key] = value
         }
         return result
     }
-    
 }
-public func decodeMultipartFormData<T: Decodable>(type: T.Type = NoDecodableData.self, stream: inout MultipartFormStream) -> (files: [String: [MultipartFormPart]], form: T?) {
-    var part: MultipartFormPart?
-    var files = [String: [MultipartFormPart]]()
-    var dictionary: [String: [Any?]] = [:]
+
+/// Decodes a multipart form stream into typed fields and separated files.
+///
+/// Parts with a filename or content type are returned in ``DecodedMultipartForm/files``.
+/// Other UTF-8 text parts are decoded into ``DecodedMultipartForm/form`` using the
+/// target `Decodable` type.
+///
+/// - Parameters:
+///   - type: The expected Swift model type for non-file fields.
+///   - stream: The multipart stream to consume.
+public func decodeMultipartFormData<T: Decodable>(type: T.Type = NoDecodableData.self, stream: inout MultipartFormStream) -> DecodedMultipartForm<T> {
+    var part: MultipartFile?
+    var files = [String: [MultipartFile]]()
+    var values: [String: [String]] = [:]
     while true {
         part = stream.next()
         guard let part else { break }
         guard let name = part.name else { continue }
         if part.filename != nil || part.contentType != nil {
             files[name, default: []].append(part)
-        } else {
-            dictionary[name, default: []].append(parseFormEntryValue(data: part.data))
+        } else if let data = part.data, let value = String(data: data, encoding: .utf8) {
+            values[name, default: []].append(value)
         }
     }
-    var normalizedDictionary: [String: Any?] = [:]
-    dictionary.forEach { key, value in
-        if value.count == 1 {
-            normalizedDictionary[key] = value.first
-        } else {
-            normalizedDictionary[key] = value
-        }
-    }
-    let jsonData = try? JSONSerialization.data(
-        withJSONObject: normalizedDictionary
+    return DecodedMultipartForm(
+        files: files,
+        form: try? FormDataDecoder(values: values).decode(T.self)
     )
-    var form: T? = nil
-    if let jsonData {
-        form = try? JSONDecoder().decode(T.self, from: jsonData)
-    }
-    return (files: files, form: form)
 }

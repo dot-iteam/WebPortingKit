@@ -6,6 +6,13 @@
 //
 
 import Foundation
+
+/// Parses a form field value using eager scalar coercion.
+///
+/// This API is retained for source compatibility. Prefer ``decodeFormURL(_:_:)`` so
+/// values are coerced using the target `Decodable` property type instead of being
+/// guessed before the destination type is known.
+@available(*, deprecated, message: "Use decodeFormURL(_:_:), getDecodedBody(type:), or getDecodedForm(type:) so values are coerced using the target Decodable type.")
 public func parseFormEntryValue(value: String?) -> Any? {
     guard let value else {
         return nil
@@ -26,8 +33,14 @@ public func parseFormEntryValue(value: String?) -> Any? {
     if let dateValue {
         return dateValue
     }
-    return nil
+    return value
 }
+
+/// Parses UTF-8 form field bytes using eager scalar coercion.
+///
+/// This API is retained for source compatibility. Prefer ``decodeFormURL(_:_:)`` so
+/// values are coerced using the target `Decodable` property type.
+@available(*, deprecated, message: "Use decodeFormURL(_:_:), getDecodedBody(type:), or getDecodedForm(type:) so values are coerced using the target Decodable type.")
 public func parseFormEntryValue(data: Data?) -> Any? {
     guard let data else {
         return nil
@@ -37,25 +50,29 @@ public func parseFormEntryValue(data: Data?) -> Any? {
     }
     return parseFormEntryValue(value: value)
 }
+
+/// Decodes an `application/x-www-form-urlencoded` body into a `Decodable` value.
+///
+/// The parser follows form-url-encoded rules: `+` represents a space and percent
+/// escapes are decoded by `URLComponents`. Repeated field names decode as arrays
+/// when the target property requests an array.
+///
+/// - Parameters:
+///   - type: The expected Swift model type.
+///   - string: The raw form-url-encoded body.
+/// - Returns: The decoded value, or `nil` when parsing or decoding fails.
 public func decodeFormURL<Target: Decodable>(_ type: Target.Type, _ string: String) -> Target? {
+    let values = parseFormURLValues(string)
+    return try? FormDataDecoder(values: values).decode(Target.self)
+}
+
+private func parseFormURLValues(_ string: String) -> [String: [String]] {
     var urlComponents = URLComponents()
-    urlComponents.percentEncodedQuery = string
-    var dictionary = [String: [Any?]]()
-    var normalizedDictionary: [String: Any?] = [:]
+    urlComponents.percentEncodedQuery = string.replacingOccurrences(of: "+", with: "%20")
+
+    var values = [String: [String]]()
     urlComponents.queryItems?.forEach { entry in
-        dictionary[entry.name, default: []].append(parseFormEntryValue(value: entry.value))
+        values[entry.name, default: []].append(entry.value ?? "")
     }
-    dictionary.forEach { key, value in
-        if dictionary[key]?.count == 1 {
-            normalizedDictionary[key] = value.first
-        } else {
-            normalizedDictionary[key] = value
-        }
-    }
-    
-    let jsonData = try? JSONSerialization.data(
-        withJSONObject: normalizedDictionary
-    )
-    guard let jsonData else { return nil }
-    return try? JSONDecoder().decode(Target.self, from: jsonData)
+    return values
 }
