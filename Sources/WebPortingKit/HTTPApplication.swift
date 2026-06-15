@@ -255,10 +255,20 @@ public struct DefaultHTTPRoutingHandler : HTTPRoutingHandler, HTTPBodyLimitProvi
         }
         return nil
     }
-    mutating func middleware(_ middleware: any HTTPMiddleware) {
+    /// Registers middleware that runs before matched routes and the not-found handler.
+    ///
+    /// Middleware runs in registration order. Returning `.respond` stops routing and
+    /// sends the current response; returning `.drop` closes the connection.
+    public mutating func middleware(_ middleware: any HTTPMiddleware) {
         self.middlewares.append(middleware)
     }
-    mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: HTTPRequestHandler) {
+
+    /// Registers an exact route for `method` and `path` using a handler value.
+    ///
+    /// Empty paths are normalized to `/`, and paths missing a leading `/` receive one.
+    /// Matching is case-insensitive because path components are lowercased before
+    /// storage.
+    public mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: HTTPRequestHandler) {
         var targetPath = path
         if targetPath.isEmpty {
             targetPath.append("/")
@@ -268,13 +278,18 @@ public struct DefaultHTTPRoutingHandler : HTTPRoutingHandler, HTTPBodyLimitProvi
         }
         maps[method.rawValue, default: [:]][targetPath.normalizedPath] = Route(handler: route, maximumBodySize: maximumBodySize)
     }
-    mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerClosure) {
+    /// Registers an exact route using a context-mutating closure.
+    public mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerClosure) {
         self.method(method: method, path: path, maximumBodySize: maximumBodySize, route: HTTPRequestHandlerClosureWrapper(closure: route))
     }
-    mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerRouterClosure) {
+
+    /// Registers an exact route using a response-returning closure.
+    public mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerRouterClosure) {
         self.method(method: method, path: path, maximumBodySize: maximumBodySize, route: HTTPRequestHandlerRouterClosureWrapper(closure: route))
     }
-    mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerDataRouteClosure) {
+
+    /// Registers an exact route using a data-returning closure.
+    public mutating func method(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerDataRouteClosure) {
         self.method(
             method: method,
             path: path,
@@ -282,7 +297,11 @@ public struct DefaultHTTPRoutingHandler : HTTPRoutingHandler, HTTPBodyLimitProvi
             route: HTTPRequestHandlerDataRouteClosureWrapper(closure: route)
         )
     }
-    mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: HTTPRequestHandler) {
+    /// Registers a prefix route for `method` and `path` using a handler value.
+    ///
+    /// A prefix route handles requests whose normalized path starts with `path`.
+    /// Exact routes registered with `method` take precedence over prefix routes.
+    public mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: HTTPRequestHandler) {
         var targetPath = path
         if targetPath.isEmpty {
             targetPath.append("/")
@@ -292,13 +311,18 @@ public struct DefaultHTTPRoutingHandler : HTTPRoutingHandler, HTTPBodyLimitProvi
         }
         matches[method.rawValue, default: []].append((targetPath.map { $0.lowercased() }, Route(handler: route, maximumBodySize: maximumBodySize)))
     }
-    mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerClosure) {
+    /// Registers a prefix route using a context-mutating closure.
+    public mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerClosure) {
         self.matchMethod(method: method, path: path, maximumBodySize: maximumBodySize, route: HTTPRequestHandlerClosureWrapper(closure: route))
     }
-    mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerRouterClosure) {
+
+    /// Registers a prefix route using a response-returning closure.
+    public mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerRouterClosure) {
         self.matchMethod(method: method, path: path, maximumBodySize: maximumBodySize, route: HTTPRequestHandlerRouterClosureWrapper(closure: route))
     }
-    mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerDataRouteClosure) {
+
+    /// Registers a prefix route using a data-returning closure.
+    public mutating func matchMethod(method: HTTPMethod, path: [String], maximumBodySize: Int? = nil, route: @escaping HTTPRequestHandlerDataRouteClosure) {
         self.matchMethod(
             method: method,
             path: path,
@@ -341,16 +365,26 @@ public struct DefaultHTTPRoutingHandler : HTTPRoutingHandler, HTTPBodyLimitProvi
             cacheControl: cacheControl
         )
     }
-    mutating func notFound(_ route: HTTPRequestHandler) {
+    /// Registers a handler for unmatched requests.
+    ///
+    /// The router forces the final response status to `404 Not Found` after this
+    /// handler runs, while preserving any response headers and body it sets.
+    public mutating func notFound(_ route: HTTPRequestHandler) {
         self.notFound = route
     }
-    mutating func notFound(_ route: @escaping HTTPRequestHandlerClosure) {
+
+    /// Registers a context-mutating closure for unmatched requests.
+    public mutating func notFound(_ route: @escaping HTTPRequestHandlerClosure) {
         self.notFound = HTTPRequestHandlerClosureWrapper(closure: route)
     }
-    mutating func notFound(_ route: @escaping HTTPRequestHandlerRouterClosure) {
+
+    /// Registers a response-returning closure for unmatched requests.
+    public mutating func notFound(_ route: @escaping HTTPRequestHandlerRouterClosure) {
         self.notFound = HTTPRequestHandlerRouterClosureWrapper(closure: route)
     }
-    mutating func notFound(_ route: @escaping HTTPRequestHandlerDataRouteClosure) {
+
+    /// Registers a data-returning closure for unmatched requests.
+    public mutating func notFound(_ route: @escaping HTTPRequestHandlerDataRouteClosure) {
         self.notFound = HTTPRequestHandlerDataRouteClosureWrapper(closure: route)
     }
 }

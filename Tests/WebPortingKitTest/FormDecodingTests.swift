@@ -84,7 +84,7 @@ struct RequestBodyDecodingTests {
             body: "zip=01234&truthy=true&number=123456"
         )
 
-        let decoded = try #require(request.getDecodedBody(type: StringPreservingForm.self))
+        let decoded = try #require(request.getForm(StringPreservingForm.self))
         #expect(decoded == StringPreservingForm(zip: "01234", truthy: "true", number: "123456"))
     }
 
@@ -95,7 +95,7 @@ struct RequestBodyDecodingTests {
             body: "name=Abdul%20Rahman&age=31&admin=true&score=9.5"
         )
 
-        let decoded = try #require(request.getDecodedBody(type: ProfileForm.self))
+        let decoded = try #require(request.getForm(ProfileForm.self))
         #expect(decoded == ProfileForm(name: "Abdul Rahman", age: 31, admin: true, score: 9.5))
     }
 
@@ -106,7 +106,7 @@ struct RequestBodyDecodingTests {
             body: "name=John+Doe&q=a%2Bb"
         )
 
-        let decoded = try #require(request.getDecodedBody(type: QueryForm.self))
+        let decoded = try #require(request.getForm(QueryForm.self))
         #expect(decoded == QueryForm(name: "John Doe", q: "a+b"))
     }
 
@@ -117,7 +117,7 @@ struct RequestBodyDecodingTests {
             body: "name=Abdul%20Rahman&age=31&admin=true&score=9.5"
         )
 
-        let decoded = try #require(request.getDecodedBody(type: ProfileForm.self))
+        let decoded = try #require(request.getForm(ProfileForm.self))
         #expect(decoded == ProfileForm(name: "Abdul Rahman", age: 31, admin: true, score: 9.5))
     }
 
@@ -128,7 +128,7 @@ struct RequestBodyDecodingTests {
             body: "{\"name\":\"Abdul Rahman\",\"age\":31,\"admin\":true,\"score\":9.5}"
         )
 
-        let decoded = try #require(request.getDecodedBody(type: ProfileForm.self))
+        let decoded = try #require(request.getForm(ProfileForm.self))
         #expect(decoded == ProfileForm(name: "Abdul Rahman", age: 31, admin: true, score: 9.5))
     }
 
@@ -149,52 +149,93 @@ struct RequestBodyDecodingTests {
         #expect(request.urlComponents.queryItems?.first?.value == "Info")
     }
 
-    @Test("getBody returns raw data when content type is missing")
-    func getBodyReturnsRawDataWhenContentTypeIsMissing() throws {
-        let request = makeRequest(contentType: nil, body: "raw-body")
-
-        guard case .data(let data) = request.getBody(type: ProfileForm.self) else {
-            Issue.record("Expected raw data body")
-            return
-        }
-        #expect(String(decoding: try #require(data), as: UTF8.self) == "raw-body")
-    }
-
-    @Test("getBody callback receives decoded form body")
-    func getBodyCallbackReceivesDecodedFormBody() throws {
-        let request = makeRequest(
-            contentType: "application/x-www-form-urlencoded",
-            body: "name=Abdul%20Rahman&age=31&admin=true&score=9.5"
-        )
-        var decoded: ProfileForm?
-
-        request.getBody(type: ProfileForm.self) { body in
-            guard case .object(let value) = body else { return }
-            decoded = value
-        }
-
-        #expect(decoded == ProfileForm(name: "Abdul Rahman", age: 31, admin: true, score: 9.5))
-    }
-
-    @Test("malformed JSON decodes to nil object")
-    func malformedJSONDecodesToNilObject() {
+    @Test("malformed JSON decodes to nil")
+    func malformedJSONDecodesToNil() {
         let request = makeRequest(contentType: "application/json", body: "{bad-json")
 
-        guard case .object(let decoded) = request.getBody(type: ProfileForm.self) else {
-            Issue.record("Expected object body")
-            return
-        }
-        #expect(decoded == nil)
-        #expect(request.getDecodedBody(type: ProfileForm.self) == nil)
+        #expect(request.getForm(ProfileForm.self) == nil)
     }
 
-    @Test("getDecodedForm returns nil form for raw data")
-    func getDecodedFormReturnsNilFormForRawData() {
-        let request = makeRequest(contentType: "application/octet-stream", body: "raw")
-        let decoded = request.getDecodedForm(type: ProfileForm.self)
+    private struct CSVPair: Decodable, Equatable {
+        let name: String
+        let age: Int
+    }
 
-        #expect(decoded.files.isEmpty)
-        #expect(decoded.form == nil)
+    @Test("getForm fallback receives body and media type for unrecognized content type")
+    func getFormFallbackHandlesUnrecognizedContentType() {
+        let request = makeRequest(contentType: "text/csv; charset=utf-8", body: "Abdul,31")
+
+        let decoded = request.getForm(CSVPair.self) { body, mediaType in
+            #expect(mediaType == "text/csv")
+            let fields = String(decoding: body, as: UTF8.self).split(separator: ",")
+            guard fields.count == 2, let age = Int(fields[1]) else { return nil }
+            return CSVPair(name: String(fields[0]), age: age)
+        }
+
+        #expect(decoded == CSVPair(name: "Abdul", age: 31))
+    }
+
+    @Test("getForm returns nil for unrecognized content type without a fallback")
+    func getFormReturnsNilForUnrecognizedContentTypeWithoutFallback() {
+        let request = makeRequest(contentType: "text/csv", body: "Abdul,31")
+
+        #expect(request.getForm(CSVPair.self) == nil)
+    }
+
+    @Test("getForm async fallback decodes unrecognized content type")
+    func getFormAsyncFallbackHandlesUnrecognizedContentType() async {
+        let request = makeRequest(contentType: "text/csv; charset=utf-8", body: "Abdul,31")
+
+        let decoded = await request.getForm(CSVPair.self) { body, mediaType in
+            #expect(mediaType == "text/csv")
+            // Simulate an asynchronous mapping source (e.g. a database lookup).
+            try await Task.sleep(nanoseconds: 1_000)
+            let fields = String(decoding: body, as: UTF8.self).split(separator: ",")
+            guard fields.count == 2, let age = Int(fields[1]) else { return nil }
+            return CSVPair(name: String(fields[0]), age: age)
+        }
+
+        #expect(decoded == CSVPair(name: "Abdul", age: 31))
+    }
+
+    @Test("getForm fallback receives nil media type when content type is missing")
+    func getFormFallbackReceivesNilMediaTypeWhenContentTypeMissing() {
+        let request = makeRequest(contentType: nil, body: "Abdul,31")
+
+        let decoded = request.getForm(CSVPair.self) { body, mediaType in
+            #expect(mediaType == nil)
+            let fields = String(decoding: body, as: UTF8.self).split(separator: ",")
+            guard fields.count == 2, let age = Int(fields[1]) else { return nil }
+            return CSVPair(name: String(fields[0]), age: age)
+        }
+
+        #expect(decoded == CSVPair(name: "Abdul", age: 31))
+    }
+
+    @Test("getForm decodes multipart with a mixed-case boundary")
+    func getFormDecodesMultipartWithMixedCaseBoundary() {
+        struct Upload: Decodable {
+            let field: String
+        }
+        let boundary = "BoundaryABC"
+        let body = """
+        --\(boundary)\r
+        Content-Disposition: form-data; name="field"\r
+        \r
+        value\r
+        --\(boundary)--\r
+        """
+        let request = makeRequest(contentType: "multipart/form-data; boundary=\(boundary)", body: body)
+
+        // The boundary is case-sensitive; lowercasing the Content-Type would break this.
+        #expect(request.getForm(Upload.self)?.field == "value")
+    }
+
+    @Test("getForm returns nil for raw data")
+    func getFormReturnsNilForRawData() {
+        let request = makeRequest(contentType: "application/octet-stream", body: "raw")
+
+        #expect(request.getForm(ProfileForm.self) == nil)
     }
 
     private func makeRequest(contentType: String?, body: String) -> HTTPRequest {
@@ -210,5 +251,58 @@ struct RequestBodyDecodingTests {
             trailers: nil,
             cookies: [:]
         )
+    }
+}
+
+@Suite("Form data decoder")
+struct FormDataDecoderTests {
+    private static let tagKey = CodingUserInfoKey(rawValue: "wpk.tag")!
+
+    /// Reads its value straight from `decoder.userInfo` to prove propagation.
+    private struct UserInfoProbe: Decodable {
+        let tag: String
+        init(from decoder: Decoder) throws {
+            tag = decoder.userInfo[FormDataDecoderTests.tagKey] as? String ?? "missing"
+        }
+    }
+
+    private struct Outer: Decodable {
+        let inner: UserInfoProbe
+    }
+
+    private struct ScalarForm: Decodable, Equatable {
+        let zip: String
+        let age: Int
+        let admin: Bool
+    }
+
+    @Test("public decoder coerces scalars against the target type")
+    func coercesScalarsAgainstTargetType() throws {
+        let decoder = FormDataDecoder(values: ["zip": ["01234"], "age": ["30"], "admin": ["true"]])
+
+        let decoded = try decoder.decode(ScalarForm.self)
+
+        // "01234" stays a String (leading zero preserved); "30" becomes Int; "true" becomes Bool.
+        #expect(decoded == ScalarForm(zip: "01234", age: 30, admin: true))
+    }
+
+    @Test("userInfo is available to the root decoder")
+    func userInfoReachesRootDecoder() throws {
+        let driver = FormDataDecoding(values: [:], userInfo: [Self.tagKey: "present"])
+
+        let probe = try driver.decode(UserInfoProbe.self)
+
+        #expect(probe.tag == "present")
+    }
+
+    @Test("userInfo is propagated to nested decoders")
+    func userInfoReachesNestedDecoders() throws {
+        let driver = FormDataDecoding(values: ["inner": ["x"]], userInfo: [Self.tagKey: "present"])
+
+        let outer = try driver.decode(Outer.self)
+
+        // The nested field is decoded through a child FormDataDecoder; before the fix
+        // its userInfo was empty and this would read "missing".
+        #expect(outer.inner.tag == "present")
     }
 }

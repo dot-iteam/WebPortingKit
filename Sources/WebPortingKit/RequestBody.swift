@@ -6,109 +6,99 @@
 //
 
 import Foundation
-import RegexBuilder
 
-/// The decoded representation selected from an HTTP request body.
-///
-/// `HTTPRequest.getBody(type:)` chooses one case from the request's `Content-Type`:
-/// JSON and form-url-encoded bodies become ``object(_:)``, multipart bodies become
-/// ``multipartFormStream(_:)``, and unknown or missing content types become raw
-/// ``data(_:)``.
-public enum RequestBody<Body: Decodable> {
-    /// A typed body decoded from JSON or `application/x-www-form-urlencoded` data.
-    case object(Body?)
-
-    /// A multipart stream ready to be consumed with ``decodeMultipartFormData(type:stream:)``.
-    case multipartFormStream(MultipartFormStream?)
-
-    /// Raw body bytes for unsupported content types, or `nil` when the request had no body.
-    case data(Data?)
-}
-
-/// Empty decodable placeholder used when only multipart files are needed.
-public struct NoDecodableData: Decodable {}
-
-private func mediaType(from contentType: String) -> String {
+private func mediaType(from contentType: String) -> String? {
     contentType
         .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
         .first?
         .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased() ?? ""
+        .lowercased()
 }
 
 extension HTTPRequest {
-    /// Decodes the body according to the request `Content-Type`.
+    /// Decodes the request body into `Form`, choosing the decoder from the `Content-Type`.
     ///
-    /// - Parameter type: The expected Swift model type for JSON or form fields.
-    /// - Returns: A ``RequestBody`` case describing the body representation that was available.
-    public func getBody<T: Decodable>(type: T.Type) -> RequestBody<T> {
-        guard let body = self.body else {
-            return .data(nil)
+    /// - `application/json` → `JSONDecoder`
+    /// - `application/x-www-form-urlencoded` → ``FormDataDecoding``
+    /// - `multipart/form-data` → ``MultipartFormDecoding`` (so `Form` may include `Data`,
+    ///   ``MultipartFile``, `[Data]`, or `[MultipartFile]` properties for file parts)
+    ///
+    /// For any other content type, `fallback` is invoked with the raw body bytes and the
+    /// lowercased media type — or `nil` when the request had no `Content-Type` — letting the
+    /// caller decode custom formats.
+    ///
+    /// - Parameters:
+    ///   - type: The expected Swift model type (inferred from context when omitted).
+    ///   - fallback: A decoder invoked with `(body, mediaType)` when the built-in decoders do
+    ///     not recognize the content type. `mediaType` is `nil` when the request had none.
+    /// - Returns: The decoded value, or `nil` when the body is missing, decoding fails, or no
+    ///   `fallback` handled an unrecognized content type.
+    public func getForm<Form: Decodable>(
+        _ type: Form.Type = Form.self,
+        fallback: ((_ body: Data, _ mediaType: String?) throws -> Form?)? = nil
+    ) -> Form? {
+        guard let body else {
+            return nil
         }
-        guard let contentType = self.headers.first(name: "content-type") else {
-            return .data(Data(buffer: body))
+        let data = Data(buffer: body)
+        guard let contentType = headers.first(name: "content-type") else {
+            guard let fallback else { return nil }
+            return try? fallback(data, nil)
         }
         switch mediaType(from: contentType) {
         case "application/json":
-            return .object(try? JSONDecoder().decode(T.self, from: Data(buffer: body)))
+            return try? JSONDecoder().decode(Form.self, from: data)
         case "application/x-www-form-urlencoded":
-            return .object(decodeFormURL(T.self, body.getString(at: 0, length: body.readableBytes) ?? ""))
+            return decodeFormURL(Form.self, String(decoding: data, as: UTF8.self))
         case "multipart/form-data":
-            return .multipartFormStream(MultipartFormStream(data: Data(buffer: body), contentType: contentType))
-        default:
-            return .data(Data(buffer: body))
-        }
-    }
-
-    /// Decodes the body and passes the selected body representation to `callback`.
-    ///
-    /// - Parameters:
-    ///   - type: The expected Swift model type for JSON or form fields.
-    ///   - callback: A synchronous callback receiving the selected ``RequestBody`` case.
-    public func getBody<T: Decodable>(type: T.Type, callback: (RequestBody<T>) -> Void) {
-        callback(getBody(type: type))
-    }
-
-    /// Returns only the typed form or JSON value from the request body.
-    ///
-    /// Multipart file parts are ignored by this helper. Use ``getDecodedForm(type:)`` when
-    /// multipart files must be retained separately from typed fields.
-    ///
-    /// - Parameter type: The expected Swift model type.
-    /// - Returns: The decoded value, or `nil` when decoding fails or the body is raw data.
-    public func getDecodedBody<T: Decodable>(type: T.Type) -> T? {
-        switch getBody(type: type) {
-        case .object(let value):
-            return value
-        case .multipartFormStream(let stream):
-            guard var stream else {
+            guard let stream = MultipartFormStream(data: data, contentType: contentType) else {
                 return nil
             }
-            return decodeMultipartFormData(type: type, stream: &stream).form
-        default:
-            return nil
+            return try? MultipartFormDecoding(stream: stream).decode(Form.self)
+        case let media:
+            guard let fallback else { return nil }
+            return try? fallback(data, media)
         }
     }
 
-    /// Decodes URL-encoded or multipart form data into typed fields and separated files.
+    /// Decodes the request body into `Form`, choosing the decoder from the `Content-Type`,
+    /// and falling back to an *asynchronous* decoder for unrecognized content types.
     ///
-    /// For `application/x-www-form-urlencoded`, ``DecodedMultipartForm/files`` is empty.
-    /// For `multipart/form-data`, non-file fields are decoded into ``DecodedMultipartForm/form``
-    /// and file-like parts are returned in ``DecodedMultipartForm/files``.
+    /// Use this overload when mapping the body to `Form` requires asynchronous work — for
+    /// example, reading from a database, a configuration store, or another async source. The
+    /// built-in JSON, form-url-encoded, and multipart decoders still run synchronously; only
+    /// unrecognized content types reach `fallback`.
     ///
-    /// - Parameter type: The expected Swift model type for non-file form fields.
-    /// - Returns: The decoded form wrapper. Missing or undecodable forms produce `form == nil`.
-    public func getDecodedForm<T: Decodable>(type: T.Type) -> DecodedMultipartForm<T> {
-        switch getBody(type: type) {
-        case .object(let value):
-            return DecodedMultipartForm(files: [:], form: value)
-        case .multipartFormStream(let stream):
-            guard var stream else {
-                return DecodedMultipartForm(files: [:], form: nil)
+    /// - Parameters:
+    ///   - type: The expected Swift model type (inferred from context when omitted).
+    ///   - fallback: An async decoder invoked with `(body, mediaType)` when the built-in
+    ///     decoders do not recognize the content type. `mediaType` is `nil` when the request
+    ///     had none.
+    /// - Returns: The decoded value, or `nil` when the body is missing, decoding fails, or the
+    ///   fallback returns `nil` or throws.
+    public func getForm<Form: Decodable>(
+        _ type: Form.Type = Form.self,
+        fallback: (_ body: Data, _ mediaType: String?) async throws -> Form?
+    ) async -> Form? {
+        guard let body else {
+            return nil
+        }
+        let data = Data(buffer: body)
+        guard let contentType = headers.first(name: "content-type") else {
+            return try? await fallback(data, nil)
+        }
+        switch mediaType(from: contentType) {
+        case "application/json":
+            return try? JSONDecoder().decode(Form.self, from: data)
+        case "application/x-www-form-urlencoded":
+            return decodeFormURL(Form.self, String(decoding: data, as: UTF8.self))
+        case "multipart/form-data":
+            guard let stream = MultipartFormStream(data: data, contentType: contentType) else {
+                return nil
             }
-            return decodeMultipartFormData(type: type, stream: &stream)
-        default:
-            return DecodedMultipartForm(files: [:], form: nil)
+            return try? MultipartFormDecoding(stream: stream).decode(Form.self)
+        case let media:
+            return try? await fallback(data, media)
         }
     }
 }

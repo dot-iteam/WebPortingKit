@@ -1,18 +1,41 @@
 import Foundation
 
-struct FormDataDecoder {
-    let values: [String: [String]]
+/// Decodes a flat form-data dictionary (`[field: [values]]`) into a `Decodable`
+/// value, driving the public ``FormDataDecoder``.
+///
+/// A field maps to a *list* of strings because form fields can repeat
+/// (e.g. `tags=a&tags=b`). Scalar coercion happens lazily, against the target
+/// type, so numeric-looking strings destined for `String` properties are left intact.
+public struct FormDataDecoding {
+    /// The decoded form fields, each mapping to its ordered list of raw string values.
+    public var values: [String: [String]]
+    /// Contextual information made available to `Decodable` types via `decoder.userInfo`.
+    public var userInfo: [CodingUserInfoKey: Any]
 
-    func decode<T: Decodable>(_ type: T.Type) throws -> T {
-        try T(from: _FormDataDecoder(storage: .dictionary(values), codingPath: []))
+    public init(values: [String: [String]], userInfo: [CodingUserInfoKey: Any] = [:]) {
+        self.values = values
+        self.userInfo = userInfo
+    }
+
+    public func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        try FormDataDecoder(values: values, userInfo: userInfo).decode(type)
     }
 }
 
-private enum FormDataStorage {
+/// The backing storage for a ``FormDataDecoder``.
+///
+/// A decoder holds either a keyed object — each field name mapped to its ordered list of
+/// raw string values — or a single field's list of values, which backs arrays and nested
+/// single values.
+public enum FormDataStorage {
+    /// A keyed object: each field name mapped to its ordered list of raw string values.
     case dictionary([String: [String]])
+
+    /// A single field's ordered list of raw string values.
     case values([String])
 
-    var firstValue: String? {
+    /// The first value when this is a ``values(_:)`` case, otherwise `nil`.
+    public var firstValue: String? {
         switch self {
         case .dictionary:
             return nil
@@ -22,44 +45,65 @@ private enum FormDataStorage {
     }
 }
 
-private final class _FormDataDecoder: Decoder {
-    let storage: FormDataStorage
-    let codingPath: [any CodingKey]
-    let userInfo: [CodingUserInfoKey: Any] = [:]
+/// A `Decoder` over a flat form-data payload.
+///
+/// Construct one with ``init(values:userInfo:)`` and call ``decode(_:)``, or hand it
+/// directly to a `Decodable`'s `init(from:)`. The `userInfo` supplied here is
+/// propagated to every nested decoder created while decoding.
+public final class FormDataDecoder: Decoder {
+    private let storage: FormDataStorage
+    public let codingPath: [any CodingKey]
+    public let userInfo: [CodingUserInfoKey: Any]
 
-    init(storage: FormDataStorage, codingPath: [any CodingKey]) {
+    fileprivate init(
+        storage: FormDataStorage,
+        codingPath: [any CodingKey],
+        userInfo: [CodingUserInfoKey: Any]
+    ) {
         self.storage = storage
         self.codingPath = codingPath
+        self.userInfo = userInfo
     }
 
-    func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
+    public convenience init(values: [String: [String]], userInfo: [CodingUserInfoKey: Any] = [:]) {
+        self.init(storage: .dictionary(values), codingPath: [], userInfo: userInfo)
+    }
+
+    public func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        try T(from: self)
+    }
+
+    public func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
         guard case .dictionary(let values) = storage else {
             throw DecodingError.typeMismatch(
                 [String: [String]].self,
                 DecodingError.Context(codingPath: codingPath, debugDescription: "Expected keyed form data")
             )
         }
-        return KeyedDecodingContainer(FormDataKeyedDecodingContainer(values: values, codingPath: codingPath))
+        return KeyedDecodingContainer(
+            FormDataKeyedDecodingContainer(values: values, codingPath: codingPath, userInfo: userInfo)
+        )
     }
 
-    func unkeyedContainer() throws -> any UnkeyedDecodingContainer {
+    public func unkeyedContainer() throws -> any UnkeyedDecodingContainer {
         guard case .values(let values) = storage else {
             throw DecodingError.typeMismatch(
                 [String].self,
                 DecodingError.Context(codingPath: codingPath, debugDescription: "Expected repeated form values")
             )
         }
-        return FormDataUnkeyedDecodingContainer(values: values, codingPath: codingPath)
+        return FormDataUnkeyedDecodingContainer(values: values, codingPath: codingPath, userInfo: userInfo)
     }
 
-    func singleValueContainer() throws -> any SingleValueDecodingContainer {
-        FormDataSingleValueDecodingContainer(value: storage.firstValue, codingPath: codingPath)
+    public func singleValueContainer() throws -> any SingleValueDecodingContainer {
+        FormDataSingleValueDecodingContainer(value: storage.firstValue, codingPath: codingPath, userInfo: userInfo)
     }
 }
 
 private struct FormDataKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
     let values: [String: [String]]
     let codingPath: [any CodingKey]
+    let userInfo: [CodingUserInfoKey: Any]
 
     var allKeys: [Key] {
         values.keys.compactMap(Key.init(stringValue:))
@@ -139,7 +183,7 @@ private struct FormDataKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingCont
         if type == Date.self {
             return try FormDataScalar.parseDate(from: rawValue(for: key), codingPath: codingPath + [key]) as! T
         }
-        return try T(from: _FormDataDecoder(storage: .values(keyValues), codingPath: codingPath + [key]))
+        return try T(from: FormDataDecoder(storage: .values(keyValues), codingPath: codingPath + [key], userInfo: userInfo))
     }
 
     func nestedContainer<NestedKey: CodingKey>(keyedBy type: NestedKey.Type, forKey key: Key) throws -> KeyedDecodingContainer<NestedKey> {
@@ -156,11 +200,11 @@ private struct FormDataKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingCont
                 DecodingError.Context(codingPath: codingPath, debugDescription: "Missing form field")
             )
         }
-        return FormDataUnkeyedDecodingContainer(values: keyValues, codingPath: codingPath + [key])
+        return FormDataUnkeyedDecodingContainer(values: keyValues, codingPath: codingPath + [key], userInfo: userInfo)
     }
 
     func superDecoder() throws -> any Decoder {
-        _FormDataDecoder(storage: .dictionary(values), codingPath: codingPath)
+        FormDataDecoder(storage: .dictionary(values), codingPath: codingPath, userInfo: userInfo)
     }
 
     func superDecoder(forKey key: Key) throws -> any Decoder {
@@ -170,7 +214,7 @@ private struct FormDataKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingCont
                 DecodingError.Context(codingPath: codingPath, debugDescription: "Missing form field")
             )
         }
-        return _FormDataDecoder(storage: .values(keyValues), codingPath: codingPath + [key])
+        return FormDataDecoder(storage: .values(keyValues), codingPath: codingPath + [key], userInfo: userInfo)
     }
 
     private func rawValue(for key: Key) throws -> String {
@@ -187,6 +231,7 @@ private struct FormDataKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingCont
 private struct FormDataUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     let values: [String]
     let codingPath: [any CodingKey]
+    let userInfo: [CodingUserInfoKey: Any]
     var currentIndex = 0
     var count: Int? { values.count }
     var isAtEnd: Bool { currentIndex >= values.count }
@@ -257,7 +302,7 @@ private struct FormDataUnkeyedDecodingContainer: UnkeyedDecodingContainer {
         if type == Date.self {
             return try FormDataScalar.parseDate(from: value, codingPath: elementPath) as! T
         }
-        return try T(from: _FormDataDecoder(storage: .values([value]), codingPath: elementPath))
+        return try T(from: FormDataDecoder(storage: .values([value]), codingPath: elementPath, userInfo: userInfo))
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(keyedBy type: NestedKey.Type) throws -> KeyedDecodingContainer<NestedKey> {
@@ -276,7 +321,7 @@ private struct FormDataUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 
     mutating func superDecoder() throws -> any Decoder {
         let value = try nextValue()
-        return _FormDataDecoder(storage: .values([value]), codingPath: codingPath)
+        return FormDataDecoder(storage: .values([value]), codingPath: codingPath, userInfo: userInfo)
     }
 
     private mutating func decodeScalar<T>(_ type: T.Type) throws -> T where T: LosslessStringConvertible {
@@ -300,6 +345,7 @@ private struct FormDataUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 private struct FormDataSingleValueDecodingContainer: SingleValueDecodingContainer {
     let value: String?
     let codingPath: [any CodingKey]
+    let userInfo: [CodingUserInfoKey: Any]
 
     func decodeNil() -> Bool {
         value == nil
@@ -365,7 +411,7 @@ private struct FormDataSingleValueDecodingContainer: SingleValueDecodingContaine
         if type == Date.self {
             return try FormDataScalar.parseDate(from: rawValue(), codingPath: codingPath) as! T
         }
-        return try T(from: _FormDataDecoder(storage: .values([rawValue()]), codingPath: codingPath))
+        return try T(from: FormDataDecoder(storage: .values([rawValue()]), codingPath: codingPath, userInfo: userInfo))
     }
 
     private func rawValue() throws -> String {
@@ -379,7 +425,7 @@ private struct FormDataSingleValueDecodingContainer: SingleValueDecodingContaine
     }
 }
 
-private enum FormDataScalar {
+enum FormDataScalar {
     static func parse<T>(_ type: T.Type, from value: String, codingPath: [any CodingKey]) throws -> T where T: LosslessStringConvertible {
         guard let parsed = T(value) else {
             throw DecodingError.typeMismatch(
@@ -401,7 +447,7 @@ private enum FormDataScalar {
     }
 }
 
-private struct FormDataIndexKey: CodingKey {
+struct FormDataIndexKey: CodingKey {
     let intValue: Int?
     let stringValue: String
 

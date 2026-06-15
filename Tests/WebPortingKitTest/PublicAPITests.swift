@@ -95,6 +95,23 @@ struct PublicResponseHelperTests {
         #expect(headers.first(name: "location") == "/target")
     }
 
+    @Test("URL redirect helpers serialize absolute string locations")
+    func urlRedirectHelpersSerializeAbsoluteStringLocations() throws {
+        let url = try #require(URL(string: "https://example.com/login?next=%2F"))
+        let response = HTTPResponse(redirect: url, status: .permanentRedirect)
+        var mutableResponse = HTTPResponse()
+        var headers = HTTPHeaders()
+
+        mutableResponse.redirect(to: url, status: .temporaryRedirect)
+        headers.add(location: url)
+
+        #expect(response.status == .permanentRedirect)
+        #expect(response.headers.first(name: "location") == "https://example.com/login?next=%2F")
+        #expect(mutableResponse.status == .temporaryRedirect)
+        #expect(mutableResponse.headers.first(name: "location") == "https://example.com/login?next=%2F")
+        #expect(headers.first(name: "location") == "https://example.com/login?next=%2F")
+    }
+
     @Test("json closure helper encodes returned value")
     func jsonClosureHelperEncodesReturnedValue() throws {
         let response = json(status: .created) {
@@ -132,52 +149,18 @@ struct PublicRequestHelperTests {
         #expect(request.urlComponents.queryItems?.first?.value == "Info")
     }
 
-    @Test("getBody returns raw data when content type is missing")
-    func getBodyReturnsRawDataWhenContentTypeIsMissing() throws {
-        let request = makeRequest(contentType: nil, body: "raw-body")
-
-        guard case .data(let data) = request.getBody(type: Profile.self) else {
-            Issue.record("Expected raw data body")
-            return
-        }
-        #expect(String(decoding: try #require(data), as: UTF8.self) == "raw-body")
-    }
-
-    @Test("getBody callback receives decoded form body")
-    func getBodyCallbackReceivesDecodedFormBody() throws {
-        let request = makeRequest(
-            contentType: "application/x-www-form-urlencoded",
-            body: "name=Abdul&age=31"
-        )
-        var decoded: Profile?
-
-        request.getBody(type: Profile.self) { body in
-            guard case .object(let value) = body else { return }
-            decoded = value
-        }
-
-        #expect(decoded == Profile(name: "Abdul", age: 31))
-    }
-
-    @Test("malformed JSON decodes to nil object")
-    func malformedJSONDecodesToNilObject() {
+    @Test("malformed JSON decodes to nil")
+    func malformedJSONDecodesToNil() {
         let request = makeRequest(contentType: "application/json", body: "{bad-json")
 
-        guard case .object(let decoded) = request.getBody(type: Profile.self) else {
-            Issue.record("Expected object body")
-            return
-        }
-        #expect(decoded == nil)
-        #expect(request.getDecodedBody(type: Profile.self) == nil)
+        #expect(request.getForm(Profile.self) == nil)
     }
 
-    @Test("getDecodedForm returns nil form for raw data")
-    func getDecodedFormReturnsNilFormForRawData() {
+    @Test("getForm returns nil for raw data")
+    func getFormReturnsNilForRawData() {
         let request = makeRequest(contentType: "application/octet-stream", body: "raw")
-        let decoded: DecodedMultipartForm<Profile> = request.getDecodedForm(type: Profile.self)
 
-        #expect(decoded.files.isEmpty)
-        #expect(decoded.form == nil)
+        #expect(request.getForm(Profile.self) == nil)
     }
 
     private func makeRequest(contentType: String?, body: String) -> HTTPRequest {
@@ -780,6 +763,61 @@ struct PublicRoutingAPITests {
         #expect(try await routeStatus(app: app, method: .DELETE, uri: "/prefix/a") == .gone)
     }
 
+    @Test("default router exact route API normalizes paths and applies body limits")
+    func defaultRouterExactRouteAPINormalizesPathsAndAppliesBodyLimits() async throws {
+        var handler = DefaultHTTPRoutingHandler(maximumBodySize: 64)
+        handler.method(method: .GET, path: ["Admin"], maximumBodySize: 32) { context in
+            context.response.status = .accepted
+            context.response.headers.add(name: "x-route", value: "exact")
+        }
+
+        let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: "/admin")
+        var context = makeContext(method: .GET, uri: "/admin")
+
+        let decision = try await handler.routeWithDecision(context: &context)
+
+        #expect(handler.maximumBodySize(for: head) == 32)
+        #expect(decision == .respond)
+        #expect(context.response.status == .accepted)
+        #expect(context.response.headers.first(name: "x-route") == "exact")
+    }
+
+    @Test("default router prefix route API serves data route output")
+    func defaultRouterPrefixRouteAPIServesDataRouteOutput() async throws {
+        var handler = DefaultHTTPRoutingHandler()
+        handler.matchMethod(method: .GET, path: ["assets"]) { _ in
+            Data("prefix body".utf8)
+        }
+        var context = makeContext(method: .GET, uri: "/assets/site.css")
+
+        let decision = try await handler.routeWithDecision(context: &context)
+
+        #expect(decision == .respond)
+        #expect(context.response.status == .ok)
+        #expect(context.response.headers.first(name: "content-type") == "application/octet-stream")
+        #expect(context.response.body?.getString(at: 0, length: context.response.body?.readableBytes ?? 0) == "prefix body")
+    }
+
+    @Test("default router not found API preserves body while forcing 404")
+    func defaultRouterNotFoundAPIPreservesBodyWhileForcing404() async throws {
+        var handler = DefaultHTTPRoutingHandler()
+        handler.notFound { _ in
+            HTTPResponse(
+                status: .ok,
+                headers: HTTPHeaders([("x-not-found", "custom")]),
+                body: ByteBufferAllocator().buffer(string: "missing")
+            )
+        }
+        var context = makeContext(method: .GET, uri: "/missing")
+
+        let decision = try await handler.routeWithDecision(context: &context)
+
+        #expect(decision == .respond)
+        #expect(context.response.status == .notFound)
+        #expect(context.response.headers.first(name: "x-not-found") == "custom")
+        #expect(context.response.body?.getString(at: 0, length: context.response.body?.readableBytes ?? 0) == "missing")
+    }
+
     private func routeStatus(
         app: HTTPApplication<DefaultHTTPRoutingHandler>,
         method: HTTPMethod,
@@ -844,5 +882,154 @@ struct PublicCookieAPITests {
         headers.add(cookie: ResponseCookie(name: "expired", value: "yes", options: .maxAge(-5)))
 
         #expect(headers.first(name: "Set-Cookie") == "expired=yes; Max-Age=0")
+    }
+
+    @Test("request cookie capture parses headers and ignores wrapped default")
+    func requestCookieCaptureParsesHeadersAndIgnoresWrappedDefault() {
+        var headers = HTTPHeaders()
+        headers.add(name: "Cookie", value: "session=abc; theme=dark")
+
+        let capture = HTTPRequestCookieCapture(wrappedValue: ["ignored": "value"], headers: headers)
+
+        #expect(capture.wrappedValue == ["session": "abc", "theme": "dark"])
+    }
+
+    @Test("cookie validators accept token names and reject separators")
+    func cookieValidatorsAcceptTokenNamesAndRejectSeparators() {
+        #expect(isValidCookieName("session-id"))
+        #expect(!isValidCookieName("bad name"))
+        #expect(isHTTPTokenByte(Array("A".utf8)[0]))
+        #expect(!isHTTPTokenByte(Array(";".utf8)[0]))
+        #expect(isValidCookieValue("abc_123"))
+        #expect(!isValidCookieValue("hello;world"))
+        #expect(isCookieValueByte(Array("!".utf8)[0]))
+        #expect(!isCookieValueByte(Array("\r".utf8)[0]))
+    }
+}
+
+@Suite("Public cache and header APIs")
+struct PublicCacheAndHeaderAPITests {
+    @Test("last modified and cache validation helpers serialize expected headers")
+    func lastModifiedAndCacheValidationHelpersSerializeExpectedHeaders() {
+        let lastModified = HTTPLastModified(Date(timeIntervalSince1970: 1_700_000_000.9))
+        let validation = HTTPCacheValidation(lastModified: lastModified, eTag: HTTPETag("\"v1\""))
+        let headers = httpCacheHeaders(validation: validation, cacheControl: "public, max-age=60")
+
+        #expect(lastModified.date == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(lastModified.headerValue == "Tue, 14 Nov 2023 22:13:20 GMT")
+        #expect(headers.first(name: "last-modified") == "Tue, 14 Nov 2023 22:13:20 GMT")
+        #expect(headers.first(name: "etag") == "\"v1\"")
+        #expect(headers.first(name: "cache-control") == "public, max-age=60")
+    }
+
+    @Test("conditional request helpers compare ETag before last modified")
+    func conditionalRequestHelpersCompareETagBeforeLastModified() {
+        let lastModified = HTTPLastModified(Date(timeIntervalSince1970: 1_700_000_000))
+        let validation = HTTPCacheValidation(lastModified: lastModified, eTag: HTTPETag("\"current\""))
+        var matchingHeaders = HTTPHeaders()
+        matchingHeaders.add(name: "if-none-match", value: "W/\"current\", \"other\"")
+        matchingHeaders.add(name: "if-modified-since", value: lastModified.headerValue)
+        var staleETagHeaders = HTTPHeaders()
+        staleETagHeaders.add(name: "if-none-match", value: "\"other\"")
+        staleETagHeaders.add(name: "if-modified-since", value: lastModified.headerValue)
+
+        #expect(matchingHeaders.ifNoneMatch == "W/\"current\", \"other\"")
+        #expect(matchingHeaders.matches(ifNoneMatch: "*", currentETag: HTTPETag("\"current\"")))
+        #expect(isNotModified(request: makeRequest(headers: matchingHeaders), validation: validation))
+        #expect(!isNotModified(request: makeRequest(headers: staleETagHeaders), validation: validation))
+    }
+
+    @Test("last modified conditional helper returns fresh and stale results")
+    func lastModifiedConditionalHelperReturnsFreshAndStaleResults() {
+        let lastModified = Date(timeIntervalSince1970: 1_700_000_000)
+        var freshHeaders = HTTPHeaders()
+        freshHeaders.add(name: "if-modified-since", value: "Tue, 14 Nov 2023 22:13:20 GMT")
+        var staleHeaders = HTTPHeaders()
+        staleHeaders.add(name: "if-modified-since", value: "Tue, 14 Nov 2023 22:13:19 GMT")
+
+        #expect(freshHeaders.ifModifiedSince == lastModified)
+        #expect(isNotModified(request: makeRequest(headers: freshHeaders), lastModified: lastModified))
+        #expect(!isNotModified(request: makeRequest(headers: staleHeaders), lastModified: lastModified))
+    }
+
+    @Test("ETag source helpers expose cache identity and generated values")
+    func eTagSourceHelpersExposeCacheIdentityAndGeneratedValues() {
+        let generation = HTTPETagGeneration(name: "length", cache: false) { data in
+            HTTPETag("\"length-\(data.count)\"")
+        }
+        let generated = HTTPETagSource.generated(generation)
+        let stringGenerated = HTTPETagSource.generated(name: "string-length") { data in
+            "\"string-length-\(data.count)\""
+        }
+        let constant = HTTPETagSource.constant("\"fixed\"")
+
+        #expect(generation.name == "length")
+        #expect(generation.cache == false)
+        #expect(generation.eTag(for: Data([1, 2])).rawValue == "\"length-2\"")
+        #expect(generated.cacheIdentity == "length")
+        #expect(generated.shouldCacheGeneratedValue == false)
+        #expect(generated.eTag(for: Data([1, 2, 3])).rawValue == "\"length-3\"")
+        #expect(stringGenerated.cacheIdentity == "string-length")
+        #expect(stringGenerated.eTag(for: Data([1])).rawValue == "\"string-length-1\"")
+        #expect(constant.cacheIdentity == nil)
+        #expect(constant.shouldCacheGeneratedValue == false)
+        #expect(constant.eTag(for: Data()).rawValue == "\"fixed\"")
+    }
+
+    private func makeRequest(headers: HTTPHeaders) -> HTTPRequest {
+        HTTPRequest(
+            url: URL(string: "/cache")!,
+            method: .GET,
+            headers: headers,
+            body: nil,
+            trailers: nil,
+            cookies: [:]
+        )
+    }
+}
+
+@Suite("Public MIME and multipart helper APIs")
+struct PublicMIMEAndMultipartHelperAPITests {
+    @Test("MIME registry normalizes extensions for lookup and registration")
+    func mimeRegistryNormalizesExtensionsForLookupAndRegistration() {
+        var registry = HTTPMimeTypeRegistry([".HTML": "text/html; charset=utf-8"])
+        registry["TXT"] = "text/plain; charset=utf-8"
+        registry.register("application/x-module", for: ".Module")
+        registry.register(contentsOf: ["DATA": "application/x-data"])
+
+        #expect(registry["html"] == "text/html; charset=utf-8")
+        #expect(registry.mimeType(for: "txt") == "text/plain; charset=utf-8")
+        #expect(registry.mimeType(for: ".module") == "application/x-module")
+        #expect(registry.mimeType(for: URL(fileURLWithPath: "/tmp/file.DATA")) == "application/x-data")
+        #expect(registry.mimeType(for: "unknown", default: "application/fallback") == "application/fallback")
+        #expect(HTTPMimeTypeRegistry.default.mimeType(for: "wasm") == "application/wasm")
+    }
+
+    @Test("multipart form decodes file parts into the model")
+    func multipartFormDecodesFilePartsIntoModel() throws {
+        struct Upload: Decodable {
+            let upload: MultipartFile
+        }
+        let boundary = "BoundaryABC"
+        let body = Data("""
+        --\(boundary)\r
+        Content-Disposition: form-data; name="upload"; filename="file.txt"\r
+        Content-Type: text/plain\r
+        \r
+        file-body\r
+        --\(boundary)--\r
+        """.utf8)
+        let stream = try #require(
+            MultipartFormStream(
+                data: body,
+                contentType: "multipart/form-data; boundary=BoundaryABC"
+            )
+        )
+
+        let decoded = try MultipartFormDecoding(stream: stream).decode(Upload.self)
+
+        #expect(decoded.upload.filename == "file.txt")
+        #expect(decoded.upload.contentType == "text/plain")
+        #expect(decoded.upload.description == "file-body")
     }
 }

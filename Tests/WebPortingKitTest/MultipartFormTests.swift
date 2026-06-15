@@ -14,49 +14,51 @@ struct MultipartFormTests {
         let count: Int
     }
 
+    private struct UploadWithFile: Decodable {
+        let field: String
+        let upload: MultipartFile
+    }
+
     @Test("parses boundary parameter name case insensitively")
     func parsesBoundaryParameterNameCaseInsensitively() throws {
         let body = makeMultipartBody(boundary: "BoundaryABC", fieldValue: "value")
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: body,
                 contentType: "multipart/form-data; Boundary=BoundaryABC"
             )
         )
-        let decoded = decodeMultipartFormData(type: UploadForm.self, stream: &stream)
 
-        #expect(decoded.form == UploadForm(field: "value"))
+        #expect(try MultipartFormDecoding(stream: stream).decode(UploadForm.self) == UploadForm(field: "value"))
     }
 
     @Test("parses quoted boundary parameter value")
     func parsesQuotedBoundaryParameterValue() throws {
         let body = makeMultipartBody(boundary: "BoundaryABC", fieldValue: "value")
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: body,
                 contentType: "multipart/form-data; boundary=\"BoundaryABC\""
             )
         )
-        let decoded = decodeMultipartFormData(type: UploadForm.self, stream: &stream)
 
-        #expect(decoded.form == UploadForm(field: "value"))
+        #expect(try MultipartFormDecoding(stream: stream).decode(UploadForm.self) == UploadForm(field: "value"))
     }
 
     @Test("parses boundary parameter after other parameters")
     func parsesBoundaryParameterAfterOtherParameters() throws {
         let body = makeMultipartBody(boundary: "BoundaryABC", fieldValue: "value")
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: body,
                 contentType: "multipart/form-data; charset=utf-8; boundary=BoundaryABC"
             )
         )
-        let decoded = decodeMultipartFormData(type: UploadForm.self, stream: &stream)
 
-        #expect(decoded.form == UploadForm(field: "value"))
+        #expect(try MultipartFormDecoding(stream: stream).decode(UploadForm.self) == UploadForm(field: "value"))
     }
 
     @Test("matches body boundary value case sensitively")
@@ -134,15 +136,14 @@ struct MultipartFormTests {
         let padded = Data("prefix".utf8) + body + Data("suffix".utf8)
         let sliced = padded[padded.startIndex + 6..<padded.endIndex - 6]
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: sliced,
                 contentType: "multipart/form-data; boundary=BoundaryABC"
             )
         )
-        let decoded = decodeMultipartFormData(type: UploadForm.self, stream: &stream)
 
-        #expect(decoded.form == UploadForm(field: "value"))
+        #expect(try MultipartFormDecoding(stream: stream).decode(UploadForm.self) == UploadForm(field: "value"))
     }
 
     @Test("multipart form preserves string fields that look like scalars")
@@ -164,20 +165,19 @@ struct MultipartFormTests {
         --\(boundary)--\r
         """.utf8)
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: body,
                 contentType: "multipart/form-data; boundary=BoundaryABC"
             )
         )
-        let decoded = decodeMultipartFormData(type: ScalarLookingMultipartForm.self, stream: &stream)
 
-        #expect(decoded.files.isEmpty)
-        #expect(decoded.form == ScalarLookingMultipartForm(zip: "01234", enabled: "true", count: 12))
+        let decoded = try MultipartFormDecoding(stream: stream).decode(ScalarLookingMultipartForm.self)
+        #expect(decoded == ScalarLookingMultipartForm(zip: "01234", enabled: "true", count: 12))
     }
 
-    @Test("multipart form keeps file parts separate from decoded fields")
-    func multipartFormKeepsFilePartsSeparateFromDecodedFields() throws {
+    @Test("multipart form decodes file parts into the model")
+    func multipartFormDecodesFilePartsIntoModel() throws {
         let boundary = "BoundaryABC"
         let body = Data("""
         --\(boundary)\r
@@ -192,19 +192,18 @@ struct MultipartFormTests {
         --\(boundary)--\r
         """.utf8)
 
-        var stream = try #require(
+        let stream = try #require(
             MultipartFormStream(
                 data: body,
                 contentType: "multipart/form-data; boundary=BoundaryABC"
             )
         )
-        let decoded = decodeMultipartFormData(type: UploadForm.self, stream: &stream)
 
-        #expect(decoded.form == UploadForm(field: "value"))
-        let upload = try #require(decoded.files["upload"]?.first)
-        #expect(upload.filename == "file.txt")
-        #expect(upload.contentType == "text/plain")
-        #expect(upload.description == "file-body")
+        let decoded = try MultipartFormDecoding(stream: stream).decode(UploadWithFile.self)
+        #expect(decoded.field == "value")
+        #expect(decoded.upload.filename == "file.txt")
+        #expect(decoded.upload.contentType == "text/plain")
+        #expect(decoded.upload.description == "file-body")
     }
 
     @Test("rejects missing boundary parameter")

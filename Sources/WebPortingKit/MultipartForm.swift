@@ -10,9 +10,8 @@ import RegexBuilder
 
 /// A file-like part from a `multipart/form-data` request.
 ///
-/// Parts with a filename or content type are treated as files by
-/// ``decodeMultipartFormData(type:stream:)`` and are kept separate from the typed
-/// form field model.
+/// Decode parts into a `Decodable` model with ``MultipartFormDecoding``, where a property
+/// typed as `Data`, ``MultipartFile``, `[Data]`, or `[MultipartFile]` receives the file(s).
 public struct MultipartFile: CustomStringConvertible {
     /// The `name` parameter from `Content-Disposition`, if present.
     public var name: String?
@@ -110,25 +109,6 @@ public struct MultipartFile: CustomStringConvertible {
             return ""
         }
         return String(data: data, encoding: .utf8) ?? ""
-    }
-}
-
-/// Compatibility alias for the previous multipart part type name.
-@available(*, deprecated, renamed: "MultipartFile")
-public typealias MultipartFormPart = MultipartFile
-
-/// A decoded multipart form with typed fields and file parts kept separate.
-public struct DecodedMultipartForm<Form: Decodable> {
-    /// File parts grouped by their form field name.
-    public let files: [String: [MultipartFile]]
-
-    /// The typed non-file form fields, or `nil` when decoding fails.
-    public let form: Form?
-
-    /// Creates a decoded multipart form result.
-    public init(files: [String: [MultipartFile]], form: Form?) {
-        self.files = files
-        self.form = form
     }
 }
 
@@ -322,33 +302,4 @@ public struct MultipartFormStream {
         }
         return result
     }
-}
-
-/// Decodes a multipart form stream into typed fields and separated files.
-///
-/// Parts with a filename or content type are returned in ``DecodedMultipartForm/files``.
-/// Other UTF-8 text parts are decoded into ``DecodedMultipartForm/form`` using the
-/// target `Decodable` type.
-///
-/// - Parameters:
-///   - type: The expected Swift model type for non-file fields.
-///   - stream: The multipart stream to consume.
-public func decodeMultipartFormData<T: Decodable>(type: T.Type = NoDecodableData.self, stream: inout MultipartFormStream) -> DecodedMultipartForm<T> {
-    var part: MultipartFile?
-    var files = [String: [MultipartFile]]()
-    var values: [String: [String]] = [:]
-    while true {
-        part = stream.next()
-        guard let part else { break }
-        guard let name = part.name else { continue }
-        if part.filename != nil || part.contentType != nil {
-            files[name, default: []].append(part)
-        } else if let data = part.data, let value = String(data: data, encoding: .utf8) {
-            values[name, default: []].append(value)
-        }
-    }
-    return DecodedMultipartForm(
-        files: files,
-        form: try? FormDataDecoder(values: values).decode(T.self)
-    )
 }

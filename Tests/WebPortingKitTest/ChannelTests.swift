@@ -225,13 +225,17 @@ struct HTTPServerLifecycleTests {
     @Test("stop closes the bound server channel")
     func stopClosesBoundServerChannel() async throws {
         let server = HTTPServer(app: HTTPApplication())
-//        let channel = EmbeddedChannel()
-//        server.channel = channel
+        let channel = EmbeddedChannel()
+        server.channel = channel
 
-        await server.stop()
-//        channel.embeddedEventLoop.run()
+        let stopTask = Task {
+            await server.stop()
+        }
+        await Task.yield()
+        channel.embeddedEventLoop.run()
+        await stopTask.value
 
-//        try await channel.closeFuture.get()
+        #expect(!channel.isActive)
         #expect(server.channel == nil)
     }
 }
